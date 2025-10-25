@@ -1,47 +1,24 @@
 
 # app.py
-# Strength Prescriptor (MVP) — v7
-# Fixes:
-#   - Streamlit deprecation: st.image(use_container_width=True) instead of use_column_width
-#   - Auto schema guard: checks SQLite schema; if mismatch from prior versions, auto-resets DB to avoid OperationalError
-# Features kept:
-#   - Calendar: create, drag/drop, click event -> open session
-#   - Sessions: visual table; reorder exercises; edit/delete sets
-#   - %1RM -> suggested kg (manual override allowed)
-#   - CSV export with TOTAL row
-#   - Analytics charts
-#   - Exercise library with image upload
-#   - SQLite DB and images stored in /tmp for Streamlit Cloud
+# Strength Prescriptor (MVP) — v9
+# New: Sidebar quick-create form to add a session from anywhere
+# Keeps: always-visible create form in Sessions, Calendar create, SQLAlchemy 2.0, schema guard, images use_container_width
 
 from __future__ import annotations
-import os
-import io
-import csv
-import sqlite3
+import os, io, csv, sqlite3
 import datetime as dt
 from typing import Optional, Dict, List
-
 import pandas as pd
 import altair as alt
 import streamlit as st
-from streamlit_calendar import calendar  # pip install streamlit-calendar
-
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Date,
-    ForeignKey, Text, DateTime, Boolean
-)
+from streamlit_calendar import calendar
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey, Text, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-# -----------------------------
-# Writable paths
-# -----------------------------
 DB_PATH = "/tmp/strength_mvp.db"
 IMAGES_DIR = "/tmp/exercise_images"
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
-# -----------------------------
-# DB
-# -----------------------------
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
     echo=False,
@@ -52,9 +29,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
-# -----------------------------
-# MODELS
-# -----------------------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -139,12 +113,8 @@ class StrengthTest(Base):
     client = relationship("Client")
     exercise = relationship("Exercise")
 
-# -----------------------------
-# SCHEMA GUARD (avoid OperationalError due to old schema)
-# -----------------------------
 def ensure_schema():
     Base.metadata.create_all(engine)
-    # Inspect required columns for tables that changed between versions
     req_cols = {
         "set_prescriptions": {"id","session_exercise_id","sets","reps","intensity_pct_1rm","load_kg","rest_sec","notes"},
         "session_exercises": {"id","session_id","exercise_id","order_index","notes"},
@@ -156,17 +126,13 @@ def ensure_schema():
                 cur.execute(f"PRAGMA table_info({table})")
                 cols = {row[1] for row in cur.fetchall()}
                 if not need.issubset(cols):
-                    raise RuntimeError(f"Schema mismatch in {table}: got {cols}, need {need}")
-    except Exception as e:
-        # Auto reset DB if mismatch (old versions present)
+                    raise RuntimeError(f"Schema mismatch in {table}")
+    except Exception:
         Base.metadata.drop_all(engine)
         Base.metadata.create_all(engine)
 
 ensure_schema()
 
-# -----------------------------
-# DEMO DATA
-# -----------------------------
 EXTENDED_EXERCISES = [
     ("Back Squat", "squat", "barbell", False),
     ("Front Squat", "squat", "barbell", False),
@@ -229,9 +195,6 @@ def init_demo_data():
 
 init_demo_data()
 
-# -----------------------------
-# HELPERS
-# -----------------------------
 def get_latest_one_rm(db, client_id: int, exercise_id: int) -> Optional[float]:
     test = (db.query(StrengthTest)
               .filter(StrengthTest.client_id == client_id,
@@ -241,10 +204,7 @@ def get_latest_one_rm(db, client_id: int, exercise_id: int) -> Optional[float]:
     return test.one_rm_kg if test else None
 
 def compute_tonnage(sets: int, reps: int, load_kg: float) -> float:
-    s = max(0, int(sets or 0))
-    r = max(0, int(reps or 0))
-    w = max(0.0, float(load_kg or 0.0))
-    return float(s * r * w)
+    return float(max(0, int(sets or 0)) * max(0, int(reps or 0)) * max(0.0, float(load_kg or 0.0)))
 
 def round_to_05(x: float) -> float:
     return round(x * 2) / 2.0
@@ -258,13 +218,9 @@ def goto_session(session_id: int):
     st.session_state["nav"] = "Sessions"
     st.experimental_rerun()
 
-# -----------------------------
-# PAGES
-# -----------------------------
 def page_exercises():
     st.title("🏋️ Exercise Library (with images)")
     db = SessionLocal()
-
     exs = db.query(Exercise).order_by(Exercise.name).all()
     for e in exs:
         cols = st.columns([1, 3])
@@ -370,58 +326,36 @@ def page_calendar():
     sessions = (db.query(TrainingSession)
                   .filter(TrainingSession.plan_id == plan.id)
                   .order_by(TrainingSession.date).all())
-    events = []
-    for s in sessions:
-        events.append({
-            "id": str(s.id),
-            "title": s.focus or "Session",
-            "start": s.date.isoformat(),
-            "end": (s.date + dt.timedelta(days=1)).isoformat(),
-        })
+    events = [{"id": str(s.id), "title": s.focus or "Session", "start": s.date.isoformat(), "end": (s.date+dt.timedelta(days=1)).isoformat()} for s in sessions]
 
     st.caption("Click a day to add a session; click an event to open it; drag & drop to reschedule.")
-    cal_options = {"editable": True, "selectable": True, "initialView": "dayGridMonth", "height": 700}
-    cal = calendar(events=events, options=cal_options)
+    cal = calendar(events=events, options={"editable": True, "selectable": True, "initialView": "dayGridMonth", "height": 700})
 
     if cal and isinstance(cal, dict):
         if cal.get("action") == "dateClick" and "date" in cal:
-            try:
-                date = dt.date.fromisoformat(cal["date"][:10])
-                st.success(f"Selected {date}. Create session:")
-                focus = st.text_input("Focus", value="Strength (calendar)")
-                notes = st.text_area("Notes", value="")
-                if st.button("Create session on selected date"):
-                    new_sess = TrainingSession(plan_id=plan.id, date=date, focus=focus, notes=notes)
-                    db.add(new_sess); db.commit()
-                    st.experimental_rerun()
-            except Exception as e:
-                st.error(f"Couldn't parse date: {e}")
+            date = dt.date.fromisoformat(cal["date"][:10])
+            st.success(f"Selected {date}. Create session:")
+            focus = st.text_input("Focus", value="Strength (calendar)")
+            notes = st.text_area("Notes", value="")
+            if st.button("Create session on selected date"):
+                new_sess = TrainingSession(plan_id=plan.id, date=date, focus=focus, notes=notes)
+                db.add(new_sess); db.commit()
+                st.experimental_rerun()
 
         if cal.get("action") == "eventClick" and "event" in cal and isinstance(cal["event"], dict):
             sid = cal["event"].get("id")
             if sid:
-                db.close()
-                goto_session(int(sid))
-                return
+                db.close(); goto_session(int(sid)); return
 
-        ev = None
-        if "eventDrop" in cal:
-            ev = cal.get("eventDrop", {}).get("event")
-        elif cal.get("action") == "eventDrop":
-            ev = cal.get("event")
+        ev = cal.get("eventDrop", {}).get("event") if "eventDrop" in cal else (cal.get("event") if cal.get("action")=="eventDrop" else None)
         if ev and isinstance(ev, dict):
             sid = ev.get("id"); start = ev.get("start")
             if sid and start:
-                try:
-                    new_date = dt.date.fromisoformat(start[:10])
-                    sess = db.get(TrainingSession, int(sid))
-                    if sess and sess.plan_id == plan.id:
-                        sess.date = new_date
-                        db.commit()
-                        st.success(f"Session #{sid} moved to {new_date}.")
-                        st.experimental_rerun()
-                except Exception as e:
-                    st.error(f"Couldn't reschedule: {e}")
+                new_date = dt.date.fromisoformat(start[:10])
+                sess = db.get(TrainingSession, int(sid))
+                if sess and sess.plan_id == plan.id:
+                    sess.date = new_date; db.commit()
+                    st.success(f"Session #{sid} moved to {new_date}."); st.experimental_rerun()
     db.close()
 
 def page_sessions():
@@ -432,19 +366,32 @@ def page_sessions():
     if not plans:
         st.info("Create a training plan first (seeded demo created one).")
         db.close(); return
-
     plan_map = {f"{p.name} ({p.start_date}→{p.end_date})": p.id for p in plans}
     psel = st.selectbox("Plan", options=list(plan_map.keys()))
     plan = db.get(TrainingPlan, plan_map[psel])
     st.caption(plan.goal)
 
-    focus_session_id = st.session_state.get("focus_session_id")
+    # Always-visible Create Session form
+    st.subheader("Create new session")
+    col1, col2, col3 = st.columns([1,2,2])
+    with col1:
+        new_date = st.date_input("Date", value=dt.date.today(), key="new_sess_date")
+    with col2:
+        new_focus = st.text_input("Focus", value="Strength", key="new_sess_focus")
+    with col3:
+        new_notes = st.text_input("Notes", value="", key="new_sess_notes")
+    if st.button("Create & open"):
+        ns = TrainingSession(plan_id=plan.id, date=new_date, focus=new_focus, notes=new_notes)
+        db.add(ns); db.commit()
+        st.success(f"Session created for {new_date}")
+        st.session_state["focus_session_id"] = ns.id
+        st.experimental_rerun()
 
-    sessions = (db.query(TrainingSession)
-                  .filter(TrainingSession.plan_id == plan.id)
-                  .order_by(TrainingSession.date).all())
+    # Load sessions
+    focus_session_id = st.session_state.get("focus_session_id")
+    sessions = (db.query(TrainingSession).filter(TrainingSession.plan_id == plan.id).order_by(TrainingSession.date).all())
     if not sessions:
-        st.info("No sessions yet. Create one in Calendar or below.")
+        st.info("No sessions yet. Create one above.")
         db.close(); return
 
     session_options = {f"{s.date} — {s.focus} (#{s.id})": s.id for s in sessions}
@@ -458,16 +405,6 @@ def page_sessions():
     exs = db.query(Exercise).order_by(Exercise.name).all()
     exmap = {e.name: e.id for e in exs}
 
-    with st.expander("➕ Add session quickly"):
-        d = st.date_input("Date", value=plan.start_date)
-        focus = st.text_input("Focus", value="Strength (basic)")
-        notes = st.text_area("Notes", value="")
-        if st.button("Add session"):
-            new_s = TrainingSession(plan_id=plan.id, date=d, focus=focus, notes=notes)
-            db.add(new_s); db.commit()
-            st.success(f"Session added for {d}")
-            st.experimental_rerun()
-
     with st.expander("➕ Add exercise to session"):
         ex_name = st.selectbox("Exercise", options=list(exmap.keys()), key=f"addex_{s.id}")
         note_ex = st.text_input("Notes (exercise)", value="", key=f"addex_note_{s.id}")
@@ -476,16 +413,11 @@ def page_sessions():
             next_order = (max_order.order_index + 1) if max_order else 1
             se = SessionExercise(session_id=s.id, exercise_id=exmap[ex_name], order_index=next_order, notes=note_ex)
             db.add(se); db.commit()
-            st.success(f"Added {ex_name}")
-            st.experimental_rerun()
+            st.success(f"Added {ex_name}"); st.experimental_rerun()
 
-    sess_ex = (db.query(SessionExercise)
-                .filter(SessionExercise.session_id == s.id)
-                .order_by(SessionExercise.order_index.asc(), SessionExercise.id.asc())
-                .all())
+    sess_ex = (db.query(SessionExercise).filter(SessionExercise.session_id == s.id).order_by(SessionExercise.order_index.asc(), SessionExercise.id.asc()).all())
 
     total_session_tonnage = 0.0
-
     for idx, se in enumerate(sess_ex):
         ex = db.get(Exercise, se.exercise_id)
         st.markdown(f"### {idx+1}. {ex.name}")
@@ -510,41 +442,26 @@ def page_sessions():
         with st.expander("Add set"):
             sets = st.number_input("Sets", 1, 20, 4, key=f"sets_{se.id}")
             reps = st.number_input("Reps", 1, 50, 6, key=f"reps_{se.id}")
-
             latest_1rm = get_latest_one_rm(db, plan.client_id, se.exercise_id)
             col_a, col_b, col_c = st.columns(3)
             with col_a:
                 pct = st.slider("Intensity (%1RM)", 30, 100, 75, step=1, key=f"pct_{se.id}")
             with col_b:
-                one_rm_input = st.number_input(
-                    "1RM from test (kg)", 0.0, 500.0,
-                    float(latest_1rm) if latest_1rm else 100.0,
-                    key=f"onerm_{se.id}"
-                )
+                one_rm_input = st.number_input("1RM from test (kg)", 0.0, 500.0, float(latest_1rm) if latest_1rm else 100.0, key=f"onerm_{se.id}")
             with col_c:
                 mode = st.radio("Load mode", ["Calculate from %1RM", "Enter kg manually"], key=f"mode_{se.id}", horizontal=False)
 
             suggested_load = round_to_05((pct / 100.0) * one_rm_input)
-            if mode == "Calculate from %1RM":
-                load = st.number_input("Load per rep (kg)", 0.0, 500.0, suggested_load, step=0.5, key=f"load_{se.id}")
-            else:
-                load = st.number_input("Load per rep (kg)", 0.0, 500.0, 60.0, step=0.5, key=f"load_{se.id}")
+            load = st.number_input("Load per rep (kg)", 0.0, 500.0, suggested_load if mode=="Calculate from %1RM" else 60.0, step=0.5, key=f"load_{se.id}")
             rest = st.number_input("Rest (s)", 0, 600, 120, key=f"rest_{se.id}")
             note_in = st.text_input("Notes", value="", key=f"note_{se.id}")
-
             st.caption(f"Suggested by %1RM: {suggested_load:.1f} kg (1RM {one_rm_input:.1f}, {pct}%). You can override.")
 
             if st.button("Add set", key=f"addset_{se.id}"):
                 if sets <= 0 or reps <= 0 or load <= 0:
                     st.error("Sets, reps and load must be > 0.")
                 else:
-                    sp = SetPrescription(
-                        session_exercise_id=se.id,
-                        sets=int(sets), reps=int(reps),
-                        intensity_pct_1rm=float(pct),
-                        load_kg=round_to_05(float(load)),
-                        rest_sec=int(rest), notes=note_in,
-                    )
+                    sp = SetPrescription(session_exercise_id=se.id, sets=int(sets), reps=int(reps), intensity_pct_1rm=float(pct), load_kg=round_to_05(float(load)), rest_sec=int(rest), notes=note_in)
                     db.add(sp); db.commit()
                     st.success("Set added"); st.experimental_rerun()
 
@@ -554,16 +471,7 @@ def page_sessions():
         for sp in sets_:
             ton = compute_tonnage(sp.sets, sp.reps, sp.load_kg)
             ex_tonnage += ton
-            data.append({
-                "Set #": sp.id,
-                "Sets": sp.sets,
-                "Reps": sp.reps,
-                "%1RM": int(sp.intensity_pct_1rm or 0),
-                "Load (kg)": float(sp.load_kg or 0.0),
-                "Rest (s)": int(sp.rest_sec or 0),
-                "Tonnage (kg)": round(ton, 1),
-                "Notes": sp.notes or "",
-            })
+            data.append({"Set #": sp.id, "Sets": sp.sets, "Reps": sp.reps, "%1RM": int(sp.intensity_pct_1rm or 0), "Load (kg)": float(sp.load_kg or 0.0), "Rest (s)": int(sp.rest_sec or 0), "Tonnage (kg)": round(ton, 1), "Notes": sp.notes or ""})
         if data:
             st.dataframe(pd.DataFrame(data), use_container_width=True)
         st.caption(f"**{ex.name} tonnage:** {ex_tonnage:.1f} kg")
@@ -587,14 +495,10 @@ def page_sessions():
                             if new_sets <= 0 or new_reps <= 0 or new_load <= 0:
                                 st.error("Sets, reps and load must be > 0.")
                             else:
-                                sp.sets = int(new_sets); sp.reps = int(new_reps)
-                                sp.intensity_pct_1rm = float(new_pct)
-                                sp.load_kg = round_to_05(float(new_load))
-                                sp.rest_sec = int(new_rest); sp.notes = new_notes
+                                sp.sets = int(new_sets); sp.reps = int(new_reps); sp.intensity_pct_1rm = float(new_pct); sp.load_kg = round_to_05(float(new_load)); sp.rest_sec = int(new_rest); sp.notes = new_notes
                                 db.commit(); st.success("Updated"); st.experimental_rerun()
                         if st.button("🗑️ Delete", key=f"del_{sp.id}"):
                             db.delete(sp); db.commit(); st.warning("Deleted"); st.experimental_rerun()
-
         st.divider()
 
     st.info(f"**Total session tonnage:** {total_session_tonnage:.1f} kg")
@@ -605,33 +509,13 @@ def page_sessions():
             ex = db.get(Exercise, se.exercise_id)
             sets_ = db.query(SetPrescription).filter(SetPrescription.session_exercise_id == se.id).all()
             for sp in sets_:
-                rows.append({
-                    "session_id": s.id,
-                    "date": s.date.isoformat(),
-                    "order": se.order_index,
-                    "exercise": ex.name,
-                    "sets": sp.sets,
-                    "reps": sp.reps,
-                    "pct_1rm": sp.intensity_pct_1rm,
-                    "load_kg": sp.load_kg,
-                    "rest_sec": sp.rest_sec,
-                    "notes": sp.notes or "",
-                    "tonnage": compute_tonnage(sp.sets, sp.reps, sp.load_kg),
-                })
+                rows.append({"session_id": s.id, "date": s.date.isoformat(), "order": se.order_index, "exercise": ex.name, "sets": sp.sets, "reps": sp.reps, "pct_1rm": sp.intensity_pct_1rm, "load_kg": sp.load_kg, "rest_sec": sp.rest_sec, "notes": sp.notes or "", "tonnage": compute_tonnage(sp.sets, sp.reps, sp.load_kg)})
         if rows:
             total_row = {k: "" for k in rows[0].keys()}
-            total_row["exercise"] = "TOTAL"
-            total_row["tonnage"] = round(sum(r["tonnage"] for r in rows), 1)
+            total_row["exercise"] = "TOTAL"; total_row["tonnage"] = round(sum(r["tonnage"] for r in rows), 1)
             rows.append(total_row)
-            buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
-            writer.writeheader(); writer.writerows(rows)
-            st.download_button(
-                "⬇️ Export session to CSV (with TOTAL)",
-                buf.getvalue(),
-                file_name=f"session_{s.id}.csv",
-                mime="text/csv",
-            )
+            buf = io.StringIO(); writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys())); writer.writeheader(); writer.writerows(rows)
+            st.download_button("⬇️ Export session to CSV (with TOTAL)", buf.getvalue(), file_name=f"session_{s.id}.csv", mime="text/csv")
 
     db.close()
 
@@ -641,15 +525,12 @@ def page_analytics():
 
     plans = db.query(TrainingPlan).all()
     if not plans:
-        st.info("No plans available.")
-        db.close(); return
+        st.info("No plans available."); db.close(); return
     plan_map = {f"{p.name} ({p.start_date}→{p.end_date})": p.id for p in plans}
     psel = st.selectbox("Plan", options=list(plan_map.keys()))
     plan = db.get(TrainingPlan, plan_map[psel])
 
-    sess = (db.query(TrainingSession)
-              .filter(TrainingSession.plan_id == plan.id)
-              .order_by(TrainingSession.date).all())
+    sess = (db.query(TrainingSession).filter(TrainingSession.plan_id == plan.id).order_by(TrainingSession.date).all())
     rows = []
     for s in sess:
         ex_links = db.query(SessionExercise).filter(SessionExercise.session_id == s.id).all()
@@ -661,52 +542,55 @@ def page_analytics():
         rows.append({"date": s.date, "session_id": s.id, "tonnage": tot})
     db.close()
 
-    if not rows:
-        st.info("No sessions yet."); return
-
+    if not rows: st.info("No sessions yet."); return
     df = pd.DataFrame(rows).sort_values("date")
     df["week"] = df["date"].apply(lambda d: f"{d.isocalendar().year}-W{d.isocalendar().week:02d}")
-    weekly = df.groupby("week", as_index=False)["tonnage"].sum()
-    weekly["cum_tonnage"] = weekly["tonnage"].cumsum()
+    weekly = df.groupby("week", as_index=False)["tonnage"].sum(); weekly["cum_tonnage"] = weekly["tonnage"].cumsum()
 
     st.subheader("Tonnage per session")
-    chart1 = alt.Chart(df).mark_bar().encode(
-        x=alt.X("date:T", title="Date"),
-        y=alt.Y("tonnage:Q", title="Tonnage (kg)"),
-        tooltip=["date:T","tonnage:Q","session_id:Q"]
-    ).properties(height=300)
-    st.altair_chart(chart1, use_container_width=True)
-
+    st.altair_chart(alt.Chart(df).mark_bar().encode(x=alt.X("date:T", title="Date"), y=alt.Y("tonnage:Q", title="Tonnage (kg)"), tooltip=["date:T","tonnage:Q","session_id:Q"]).properties(height=300), use_container_width=True)
     st.subheader("Weekly cumulative tonnage")
-    chart2 = alt.Chart(weekly).mark_line(point=True).encode(
-        x=alt.X("week:N", title="ISO week"),
-        y=alt.Y("cum_tonnage:Q", title="Cumulative Tonnage (kg)"),
-        tooltip=["week:N","tonnage:Q","cum_tonnage:Q"]
-    ).properties(height=300)
-    st.altair_chart(chart2, use_container_width=True)
+    st.altair_chart(alt.Chart(weekly).mark_line(point=True).encode(x=alt.X("week:N", title="ISO week"), y=alt.Y("cum_tonnage:Q", title="Cumulative Tonnage (kg)"), tooltip=["week:N","tonnage:Q","cum_tonnage:Q"]).properties(height=300), use_container_width=True)
+
+# ---------- App layout & sidebar quick-create ----------
+st.set_page_config(page_title="Strength Prescriptor (MVP)", layout="wide")
+with st.sidebar:
+    st.title("Strength Prescriptor (MVP)")
+
+    # Sidebar quick-create
+    try:
+        db_sb = SessionLocal()
+        plans_sb = db_sb.query(TrainingPlan).all()
+        if plans_sb:
+            plan_map_sb = {f"{p.name} ({p.start_date}→{p.end_date})": p.id for p in plans_sb}
+            sel_plan_sb = st.selectbox("Plan for quick create", options=list(plan_map_sb.keys()), key="sb_plan")
+            date_sb = st.date_input("Date", value=dt.date.today(), key="sb_date")
+            focus_sb = st.text_input("Focus", value="Strength", key="sb_focus")
+            notes_sb = st.text_input("Notes", value="", key="sb_notes")
+            if st.button("➕ Create session", key="sb_btn_create"):
+                ns = TrainingSession(plan_id=plan_map_sb[sel_plan_sb], date=date_sb, focus=focus_sb, notes=notes_sb)
+                db_sb.add(ns); db_sb.commit()
+                st.success(f"Session #{ns.id} created for {date_sb}")
+                st.session_state["focus_session_id"] = ns.id
+                st.session_state["nav"] = "Sessions"
+                st.experimental_rerun()
+        else:
+            st.info("No plans yet. A demo plan is created at first run.")
+    finally:
+        try:
+            db_sb.close()
+        except Exception:
+            pass
+
+    page = st.radio("Navigation", ["Calendar", "Sessions", "Strength Tests", "Exercises", "Analytics", "Settings"], key="nav")
 
 def page_settings():
     st.title("⚙️ Settings")
     st.write("SQLite path: `/tmp/strength_mvp.db` — Exercise images under `/tmp/exercise_images`")
     if st.button("Reset database (danger)"):
-        Base.metadata.drop_all(engine)
-        Base.metadata.create_all(engine)
-        init_demo_data()
-        st.success("Database reset.")
+        Base.metadata.drop_all(engine); Base.metadata.create_all(engine); init_demo_data(); st.success("Database reset.")
 
-# -----------------------------
-# NAV
-# -----------------------------
-st.set_page_config(page_title="Strength Prescriptor (MVP)", layout="wide")
-with st.sidebar:
-    st.title("Strength Prescriptor (MVP)")
-
-page = st.sidebar.radio(
-    "Navigation",
-    ["Calendar", "Sessions", "Strength Tests", "Exercises", "Analytics", "Settings"],
-    key="nav"
-)
-
+# Route
 if page == "Calendar":
     page_calendar()
 elif page == "Sessions":
