@@ -1,21 +1,23 @@
 
 # app.py
-# Strength Prescriptor (MVP) — v6
+# Strength Prescriptor (MVP) — v7
 # Fixes:
-# - SQLAlchemy 2.0 compatible: use Session.get(Model, id) instead of Query.get()
-# Features:
-# - Calendar: create, drag/drop reschedule, click event -> open session
-# - Sessions: visual table; reorder exercises (up/down); edit/delete sets
-# - %1RM -> suggested kg (manual override allowed)
-# - CSV export with TOTAL row
-# - Analytics charts
-# - Exercise library with image upload
-# - SQLite DB and images stored in /tmp for Streamlit Cloud
+#   - Streamlit deprecation: st.image(use_container_width=True) instead of use_column_width
+#   - Auto schema guard: checks SQLite schema; if mismatch from prior versions, auto-resets DB to avoid OperationalError
+# Features kept:
+#   - Calendar: create, drag/drop, click event -> open session
+#   - Sessions: visual table; reorder exercises; edit/delete sets
+#   - %1RM -> suggested kg (manual override allowed)
+#   - CSV export with TOTAL row
+#   - Analytics charts
+#   - Exercise library with image upload
+#   - SQLite DB and images stored in /tmp for Streamlit Cloud
 
 from __future__ import annotations
 import os
 import io
 import csv
+import sqlite3
 import datetime as dt
 from typing import Optional, Dict, List
 
@@ -137,7 +139,30 @@ class StrengthTest(Base):
     client = relationship("Client")
     exercise = relationship("Exercise")
 
-Base.metadata.create_all(engine)
+# -----------------------------
+# SCHEMA GUARD (avoid OperationalError due to old schema)
+# -----------------------------
+def ensure_schema():
+    Base.metadata.create_all(engine)
+    # Inspect required columns for tables that changed between versions
+    req_cols = {
+        "set_prescriptions": {"id","session_exercise_id","sets","reps","intensity_pct_1rm","load_kg","rest_sec","notes"},
+        "session_exercises": {"id","session_id","exercise_id","order_index","notes"},
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for table, need in req_cols.items():
+                cur.execute(f"PRAGMA table_info({table})")
+                cols = {row[1] for row in cur.fetchall()}
+                if not need.issubset(cols):
+                    raise RuntimeError(f"Schema mismatch in {table}: got {cols}, need {need}")
+    except Exception as e:
+        # Auto reset DB if mismatch (old versions present)
+        Base.metadata.drop_all(engine)
+        Base.metadata.create_all(engine)
+
+ensure_schema()
 
 # -----------------------------
 # DEMO DATA
@@ -180,25 +205,27 @@ EXTENDED_EXERCISES = [
 
 def init_demo_data():
     db = SessionLocal()
-    if not db.query(User).first():
-        coach = User(email="coach@example.com", name="Coach Demo", role="coach", hash="demo")
-        client_user = User(email="client@example.com", name="Client Demo", role="client", hash="demo")
-        db.add_all([coach, client_user]); db.commit()
+    try:
+        if not db.query(User).first():
+            coach = User(email="coach@example.com", name="Coach Demo", role="coach", hash="demo")
+            client_user = User(email="client@example.com", name="Client Demo", role="client", hash="demo")
+            db.add_all([coach, client_user]); db.commit()
 
-        c = Client(user_id=client_user.id, sex="female", dob=dt.date(1990,1,1),
-                   height_cm=165, weight_kg=60, owner_id=coach.id)
-        db.add(c)
-        for name, cat, equip, uni in EXTENDED_EXERCISES:
-            if not db.query(Exercise).filter(Exercise.name == name).first():
-                db.add(Exercise(name=name, category=cat, equipment=equip, unilateral=uni))
-        db.commit()
-        if not db.query(TrainingPlan).first():
-            plan = TrainingPlan(client_id=c.id, name="Preseason 4 weeks",
-                                start_date=dt.date.today(),
-                                end_date=dt.date.today()+dt.timedelta(days=27),
-                                goal="General strength development")
-            db.add(plan); db.commit()
-    db.close()
+            c = Client(user_id=client_user.id, sex="female", dob=dt.date(1990,1,1),
+                       height_cm=165, weight_kg=60, owner_id=coach.id)
+            db.add(c)
+            for name, cat, equip, uni in EXTENDED_EXERCISES:
+                if not db.query(Exercise).filter(Exercise.name == name).first():
+                    db.add(Exercise(name=name, category=cat, equipment=equip, unilateral=uni))
+            db.commit()
+            if not db.query(TrainingPlan).first():
+                plan = TrainingPlan(client_id=c.id, name="Preseason 4 weeks",
+                                    start_date=dt.date.today(),
+                                    end_date=dt.date.today()+dt.timedelta(days=27),
+                                    goal="General strength development")
+                db.add(plan); db.commit()
+    finally:
+        db.close()
 
 init_demo_data()
 
@@ -243,7 +270,7 @@ def page_exercises():
         cols = st.columns([1, 3])
         with cols[0]:
             if e.image_path and os.path.exists(e.image_path):
-                st.image(e.image_path, use_column_width=True)
+                st.image(e.image_path, use_container_width=True)
             else:
                 st.caption("No image")
         with cols[1]:
