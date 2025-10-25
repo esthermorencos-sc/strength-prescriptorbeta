@@ -1,18 +1,16 @@
 
 # app.py
-# Strength Prescriptor (MVP) — v11
-# - Redesigned Sessions UI:
-#     * Coach/Athlete toggle
-#     * Card-per-exercise layout
-#     * Inline table editor for sets (add/edit/delete) with automatic tonnage
-#     * Quick-add templates (5x5, 4x8, etc.)
-# - Athlete View: clean, compact display ready to read/execute
-# - Analytics: robust week computation (handles different Python versions), guards against empty data
-# - Keeps: Calendar (click/drag/open), sidebar quick-create, %1RM->kg or manual, images, CSV with TOTAL,
-#          reorder exercises, schema guard, SQLAlchemy 2.0 compatibility
+# Strength Prescriptor (MVP) — v13
+# - Replaced all st.experimental_rerun() with st.rerun() (fixes AttributeError)
+# - Session page redesigned:
+#     * **Session table (editable)** — one grid for the whole session: Exercise, Sets, Reps, %1RM, Load, Rest, Notes, Tonnage.
+#       You can add/remove/edit rows; Save persists to DB (UPSERT + DELETE), creating SessionExercise links if missing.
+#     * Up/Down exercise order buttons fixed.
+#     * Athlete view shows a compact, grouped table (read-only).
+# - Keeps: Calendar (click/drag/open), sidebar quick-create, Strength Tests, images, CSV w/ TOTAL, analytics week fix, schema guard.
 
 from __future__ import annotations
-import os, io, csv, sqlite3, traceback
+import os, io, csv, sqlite3
 import datetime as dt
 from typing import Optional, Dict, List
 import pandas as pd
@@ -137,7 +135,6 @@ def ensure_schema():
 
 ensure_schema()
 
-# Demo data
 EXTENDED_EXERCISES = [
     ("Back Squat", "squat", "barbell", False),
     ("Front Squat", "squat", "barbell", False),
@@ -199,7 +196,6 @@ def init_demo_data():
 
 init_demo_data()
 
-# Helpers
 def ensure_plan(db) -> TrainingPlan:
     plan = db.query(TrainingPlan).order_by(TrainingPlan.id.asc()).first()
     if plan: return plan
@@ -235,7 +231,6 @@ def round_to_05(x: float) -> float:
 
 def iso_year_week(date_obj: dt.date) -> str:
     iso = date_obj.isocalendar()
-    # Python 3.8+: iso is namedtuple with attributes; else tuple
     week = getattr(iso, "week", iso[1])
     year = getattr(iso, "year", iso[0])
     return f"{year}-W{week:02d}"
@@ -243,110 +238,9 @@ def iso_year_week(date_obj: dt.date) -> str:
 def goto_session(session_id: int):
     st.session_state["focus_session_id"] = int(session_id)
     st.session_state["nav"] = "Sessions"
-    st.experimental_rerun()
+    st.rerun()
 
-# UI building blocks
-def sets_editor(db, session_exercise_id: int, client_id: int, exercise_id: int):
-    latest_1rm = get_latest_one_rm(db, client_id, exercise_id)
-    default_onerm = float(latest_1rm) if latest_1rm else 100.0
-
-    st.caption(f"Last 1RM: {default_onerm:.1f} kg (if exists).")
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        pct = st.slider("Intensity (%1RM)", 30, 100, 75, key=f"pct_{session_exercise_id}")
-    with col_b:
-        onerm = st.number_input("1RM (kg)", 0.0, 500.0, default_onerm, key=f"onerm_{session_exercise_id}")
-    with col_c:
-        suggested = round_to_05((pct/100.0)*onerm)
-        st.metric("Suggested load (kg)", f"{suggested:.1f}")
-
-    st.write("**Sets table** (edit directly; one row = a block like '4×6 @ 60kg')")
-    existing = db.query(SetPrescription).filter(SetPrescription.session_exercise_id == session_exercise_id).all()
-    df = pd.DataFrame([{
-        "id": sp.id, "sets": int(sp.sets), "reps": int(sp.reps),
-        "intensity_pct_1rm": float(sp.intensity_pct_1rm or pct),
-        "load_kg": float(sp.load_kg),
-        "rest_sec": int(sp.rest_sec or 90),
-        "notes": sp.notes or "",
-        "tonnage": compute_tonnage(sp.sets, sp.reps, sp.load_kg),
-    } for sp in existing])
-
-    if df.empty:
-        df = pd.DataFrame([{
-            "id": None, "sets": 4, "reps": 6,
-            "intensity_pct_1rm": pct,
-            "load_kg": suggested,
-            "rest_sec": 120, "notes": "",
-            "tonnage": compute_tonnage(4,6,suggested),
-        }])
-
-    edited = st.data_editor(
-        df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "id": st.column_config.NumberColumn("ID", disabled=True),
-            "sets": st.column_config.NumberColumn("Sets", min_value=1, max_value=50, step=1),
-            "reps": st.column_config.NumberColumn("Reps", min_value=1, max_value=100, step=1),
-            "intensity_pct_1rm": st.column_config.NumberColumn("%1RM", min_value=30, max_value=100, step=1),
-            "load_kg": st.column_config.NumberColumn("Load (kg)", min_value=0.0, max_value=500.0, step=0.5, help="Auto-fill with suggestion or enter manually"),
-            "rest_sec": st.column_config.NumberColumn("Rest (s)", min_value=0, max_value=1000, step=5),
-            "notes": st.column_config.TextColumn("Notes"),
-            "tonnage": st.column_config.NumberColumn("Tonnage (kg)", disabled=True),
-        },
-        hide_index=True,
-        key=f"editor_{session_exercise_id}",
-    )
-
-    # Recompute tonnage live
-    edited["tonnage"] = edited.apply(lambda r: compute_tonnage(r["sets"], r["reps"], r["load_kg"]), axis=1)
-    st.caption(f"Tonnage in this exercise: **{edited['tonnage'].sum():.1f} kg**")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("💾 Save sets", key=f"save_{session_exercise_id}"):
-            # Persist changes: upsert rows by id; delete removed ids
-            current_ids = set(int(x) for x in edited["id"].dropna().astype(int).tolist())
-            for sp in existing:
-                if sp.id not in current_ids:
-                    db.delete(sp)
-            for _, row in edited.iterrows():
-                if pd.isna(row["sets"]) or pd.isna(row["reps"]) or pd.isna(row["load_kg"]):
-                    continue
-                if pd.isna(row["id"]):
-                    sp = SetPrescription(
-                        session_exercise_id=session_exercise_id,
-                        sets=int(row["sets"]), reps=int(row["reps"]),
-                        intensity_pct_1rm=float(row["intensity_pct_1rm"]),
-                        load_kg=round_to_05(float(row["load_kg"])),
-                        rest_sec=int(row["rest_sec"]), notes=str(row["notes"]),
-                    )
-                    db.add(sp)
-                else:
-                    sp = db.get(SetPrescription, int(row["id"]))
-                    if sp:
-                        sp.sets=int(row["sets"]); sp.reps=int(row["reps"])
-                        sp.intensity_pct_1rm=float(row["intensity_pct_1rm"])
-                        sp.load_kg=round_to_05(float(row["load_kg"]))
-                        sp.rest_sec=int(row["rest_sec"]); sp.notes=str(row["notes"])
-            db.commit()
-            st.success("Sets saved.")
-    with c2:
-        if st.button("📋 Template 5×5", key=f"tpl55_{session_exercise_id}"):
-            st.session_state[f"editor_{session_exercise_id}"] = pd.DataFrame([
-                {"id":None,"sets":5,"reps":5,"intensity_pct_1rm":pct,"load_kg":round_to_05((pct/100.0)*onerm),"rest_sec":120,"notes":""}
-            ])
-            st.experimental_rerun()
-    with c3:
-        if st.button("📋 Template 4×8", key=f"tpl48_{session_exercise_id}"):
-            st.session_state[f"editor_{session_exercise_id}"] = pd.DataFrame([
-                {"id":None,"sets":4,"reps":8,"intensity_pct_1rm":pct,"load_kg":round_to_05((pct/100.0)*onerm),"rest_sec":90,"notes":""}
-            ])
-            st.experimental_rerun()
-
-    return float(edited["tonnage"].sum())
-
-# Pages
+# ---------- Pages ----------
 def page_exercises():
     st.title("🏋️ Exercise Library")
     db = SessionLocal()
@@ -389,7 +283,7 @@ def page_exercises():
                     path = os.path.join(IMAGES_DIR, safe)
                     with open(path, "wb") as f: f.write(image_file.read())
                     ex_obj.image_path = path; db2.commit()
-                st.success("Exercise saved.")
+                st.success("Exercise saved."); st.rerun()
         db2.close()
     db.close()
 
@@ -410,7 +304,7 @@ def page_strength_tests():
     notes = st.text_area("Notes", "")
     if st.button("Save 1RM test"):
         t = StrengthTest(client_id=client_map[client_name], exercise_id=exmap[ex_name], date=date, one_rm_kg=onerm, notes=notes)
-        db.add(t); db.commit(); st.success("Test saved")
+        db.add(t); db.commit(); st.success("Test saved"); st.rerun()
     db.close()
 
 def page_calendar():
@@ -444,7 +338,7 @@ def page_calendar():
                     db2.add(new_sess); db2.commit()
                     st.session_state["focus_session_id"] = new_sess.id
                     st.session_state["nav"] = "Sessions"
-                    st.experimental_rerun()
+                    st.rerun()
 
         if cal.get("action") == "eventClick" and "event" in cal and isinstance(cal["event"], dict):
             sid = cal["event"].get("id")
@@ -458,7 +352,7 @@ def page_calendar():
                 sess = db.get(TrainingSession, int(sid))
                 if sess:
                     sess.date = new_date; db.commit()
-                    st.success(f"Session #{sid} moved to {new_date}."); st.experimental_rerun()
+                    st.success(f"Session #{sid} moved to {new_date}."); st.rerun()
     db.close()
 
 def page_sessions():
@@ -473,7 +367,7 @@ def page_sessions():
     plan = db.get(TrainingPlan, plan_map[psel])
     st.caption(plan.goal)
 
-    # Create Session (form)
+    # Create Session
     with st.form("create_session_form", clear_on_submit=True):
         cols = st.columns([1,2,2])
         with cols[0]: new_date = st.date_input("Date", value=dt.date.today(), key="new_sess_date")
@@ -484,7 +378,7 @@ def page_sessions():
         with SessionLocal() as db2:
             ns = TrainingSession(plan_id=plan.id, date=new_date, focus=new_focus, notes=new_notes)
             db2.add(ns); db2.commit()
-            st.session_state["focus_session_id"] = ns.id; st.experimental_rerun()
+            st.session_state["focus_session_id"] = ns.id; st.rerun()
 
     # Load sessions
     focus_session_id = st.session_state.get("focus_session_id")
@@ -499,89 +393,181 @@ def page_sessions():
     session_id = session_options[sel_label]
     s = db.get(TrainingSession, session_id)
 
-    mode = st.toggle("Athlete view", value=False, help="Switch between Coach (edit) and Athlete (read) views.")
+    mode_athlete = st.toggle("Athlete view", value=False)
 
-    # Add exercise
-    with st.expander("➕ Add exercise to session (Coach)"):
-        exs = db.query(Exercise).order_by(Exercise.name).all()
-        exmap = {e.name: e.id for e in exs}
-        col1, col2 = st.columns([2,1])
-        with col1:
-            ex_name = st.selectbox("Exercise", options=list(exmap.keys()), key=f"addex_{s.id}")
-        with col2:
-            note_ex = st.text_input("Notes (exercise)", value="", key=f"addex_note_{s.id}")
-        if st.button("Add exercise", key=f"btn_addex_{s.id}"):
-            max_order = db.query(SessionExercise).filter(SessionExercise.session_id==s.id).order_by(SessionExercise.order_index.desc()).first()
-            next_order = (max_order.order_index + 1) if max_order else 1
-            se = SessionExercise(session_id=s.id, exercise_id=exmap[ex_name], order_index=next_order, notes=note_ex)
-            db.add(se); db.commit(); st.success(f"Added {ex_name}"); st.experimental_rerun()
+    # Exercise list and order controls
+    sess_ex = (db.query(SessionExercise)
+                 .filter(SessionExercise.session_id == s.id)
+                 .order_by(SessionExercise.order_index.asc(), SessionExercise.id.asc()).all())
 
-    sess_ex = (db.query(SessionExercise).filter(SessionExercise.session_id == s.id).order_by(SessionExercise.order_index.asc(), SessionExercise.id.asc()).all())
-
-    total_session_tonnage = 0.0
-
-    for idx, se in enumerate(sess_ex):
-        ex = db.get(Exercise, se.exercise_id)
-        with st.container(border=True):
-            header_cols = st.columns([6,2,2,2])
-            with header_cols[0]:
-                st.markdown(f"### {idx+1}. {ex.name}")
-                if ex.image_path and os.path.exists(ex.image_path):
-                    st.image(ex.image_path, width=180)
-            with header_cols[1]:
-                if not mode and st.button("⬆️ Move up", key=f"up_{se.id}") and idx > 0:
+    if not mode_athlete:
+        st.subheader("Exercises (order)")
+        for idx, se in enumerate(sess_ex):
+            ex = db.get(Exercise, se.exercise_id)
+            cols = st.columns([6,1,1,1])
+            with cols[0]:
+                st.write(f"{idx+1}. **{ex.name}**")
+            with cols[1]:
+                if st.button("⬆️", key=f"up_{se.id}") and idx > 0:
                     above = sess_ex[idx-1]
                     se.order_index, above.order_index = above.order_index, se.order_index
-                    db.commit(); st.experimental_rerun()
-            with header_cols[2]:
-                if not mode and st.button("⬇️ Move down", key=f"down_{se.id}") and idx < len(sess_ex)-1:
+                    db.commit(); st.rerun()
+            with cols[2]:
+                if st.button("⬇️", key=f"down_{se.id}") and idx < len(sess_ex)-1:
                     below = sess_ex[idx+1]
                     se.order_index, below.order_index = below.order_index, se.order_index
-                    db.commit(); st.experimental_rerun()
-            with header_cols[3]:
-                if not mode and st.button("🗑️ Remove", key=f"del_se_{se.id}"):
+                    db.commit(); st.rerun()
+            with cols[3]:
+                if st.button("🗑️", key=f"del_{se.id}"):
                     for sp in db.query(SetPrescription).filter(SetPrescription.session_exercise_id==se.id).all():
                         db.delete(sp)
-                    db.delete(se); db.commit(); st.warning("Exercise removed"); st.experimental_rerun()
+                    db.delete(se); db.commit(); st.warning("Exercise removed"); st.rerun()
 
-            if not mode:
-                ton_ex = sets_editor(db, se.id, plan.client_id, se.exercise_id)
-            else:
-                # Athlete view: read-only compact table
-                sets_ = db.query(SetPrescription).filter(SetPrescription.session_exercise_id == se.id).all()
-                if not sets_:
-                    st.caption("No sets yet.")
-                else:
-                    df = pd.DataFrame([{
-                        "Sets": sp.sets, "Reps": sp.reps, "%1RM": int(sp.intensity_pct_1rm or 0),
-                        "Load (kg)": float(sp.load_kg or 0.0), "Rest (s)": int(sp.rest_sec or 0),
-                        "Notes": sp.notes or "", "Tonnage (kg)": compute_tonnage(sp.sets, sp.reps, sp.load_kg)
-                    } for sp in sets_])
-                    st.dataframe(df, use_container_width=True)
-                    ton_ex = df["Tonnage (kg)"].sum()
-            st.caption(f"**Exercise tonnage:** {ton_ex:.1f} kg")
-            total_session_tonnage += ton_ex
+        with st.expander("➕ Add exercise to session"):
+            exs = db.query(Exercise).order_by(Exercise.name).all()
+            exmap = {e.name: e.id for e in exs}
+            ex_name = st.selectbox("Exercise", options=list(exmap.keys()), key=f"addex_{s.id}")
+            if st.button("Add exercise", key=f"btn_addex_{s.id}"):
+                max_order = db.query(SessionExercise).filter(SessionExercise.session_id==s.id).order_by(SessionExercise.order_index.desc()).first()
+                next_order = (max_order.order_index + 1) if max_order else 1
+                se = SessionExercise(session_id=s.id, exercise_id=exmap[ex_name], order_index=next_order)
+                db.add(se); db.commit(); st.success(f"Added {ex_name}"); st.rerun()
 
-    st.success(f"**Total session tonnage:** {total_session_tonnage:.1f} kg")
+    # -------- Session table (editable) --------
+    st.subheader("Session table (editable)")
+    # Load all sets across exercises
+    ex_lookup = {se.id: db.get(Exercise, se.exercise_id).name for se in sess_ex}
+    ex_name_to_id = {db.get(Exercise, se.exercise_id).name: se.id for se in sess_ex}
 
-    # Export CSV
     rows = []
     for se in sess_ex:
-        ex = db.get(Exercise, se.exercise_id)
         sets_ = db.query(SetPrescription).filter(SetPrescription.session_exercise_id == se.id).all()
         for sp in sets_:
             rows.append({
-                "session_id": s.id, "date": s.date.isoformat(), "order": se.order_index,
-                "exercise": ex.name, "sets": sp.sets, "reps": sp.reps,
-                "pct_1rm": sp.intensity_pct_1rm, "load_kg": sp.load_kg,
-                "rest_sec": sp.rest_sec, "notes": sp.notes or "",
+                "id": sp.id,
+                "exercise": ex_lookup[se.id],
+                "sets": sp.sets,
+                "reps": sp.reps,
+                "%1RM": int(sp.intensity_pct_1rm or 0),
+                "load_kg": float(sp.load_kg or 0.0),
+                "rest_sec": int(sp.rest_sec or 0),
+                "notes": sp.notes or "",
                 "tonnage": compute_tonnage(sp.sets, sp.reps, sp.load_kg),
             })
-    if rows:
-        total_row = {k: "" for k in rows[0].keys()}
-        total_row["exercise"] = "TOTAL"; total_row["tonnage"] = round(sum(r["tonnage"] for r in rows), 1)
-        rows.append(total_row)
-        buf = io.StringIO(); writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys())); writer.writeheader(); writer.writerows(rows)
+    if not rows:
+        # Provide one empty row to start
+        first_ex_name = next(iter(ex_name_to_id.keys()), None)
+        rows = [{
+            "id": None,
+            "exercise": first_ex_name if first_ex_name else "",
+            "sets": 4, "reps": 6, "%1RM": 70, "load_kg": 40.0, "rest_sec": 90, "notes": "",
+            "tonnage": compute_tonnage(4,6,40.0)
+        }]
+
+    df = pd.DataFrame(rows)
+
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "exercise": st.column_config.SelectboxColumn("Exercise", options=list(ex_name_to_id.keys()), help="Pick exercise for this row"),
+            "sets": st.column_config.NumberColumn("Sets", min_value=1, max_value=50, step=1),
+            "reps": st.column_config.NumberColumn("Reps", min_value=1, max_value=100, step=1),
+            "%1RM": st.column_config.NumberColumn("%1RM", min_value=0, max_value=100, step=1),
+            "load_kg": st.column_config.NumberColumn("Load (kg)", min_value=0.0, max_value=500.0, step=0.5),
+            "rest_sec": st.column_config.NumberColumn("Rest (s)", min_value=0, max_value=1000, step=5),
+            "notes": st.column_config.TextColumn("Notes"),
+            "tonnage": st.column_config.NumberColumn("Tonnage (kg)", disabled=True),
+        },
+        hide_index=True,
+        key=f"session_editor_{s.id}",
+    )
+
+    # recompute tonnage live
+    edited["tonnage"] = edited.apply(lambda r: compute_tonnage(int(r["sets"]), int(r["reps"]), float(r["load_kg"])), axis=1)
+    st.caption(f"Total session tonnage (live): **{edited['tonnage'].sum():.1f} kg**")
+
+    if not mode_athlete:
+        if st.button("💾 Save session table"):
+            # Persist changes
+            # Map existing SP ids
+            existing_ids = {r["id"] for r in rows if r["id"] is not None}
+            new_ids = set(int(x) for x in edited["id"].dropna().astype(int).tolist())
+            # Delete removed
+            to_delete = existing_ids - new_ids
+            for spid in to_delete:
+                sp = db.get(SetPrescription, int(spid))
+                if sp: db.delete(sp)
+            # Upsert rows
+            for _, row in edited.iterrows():
+                ex_name = str(row["exercise"]).strip()
+                if not ex_name:
+                    continue
+                # Ensure a SessionExercise exists
+                if ex_name not in ex_name_to_id:
+                    # create new SessionExercise at end
+                    max_order = db.query(SessionExercise).filter(SessionExercise.session_id==s.id).order_by(SessionExercise.order_index.desc()).first()
+                    next_order = (max_order.order_index + 1) if max_order else 1
+                    ex_obj = db.query(Exercise).filter(Exercise.name==ex_name).first()
+                    if not ex_obj:
+                        ex_obj = Exercise(name=ex_name, category="other", equipment="", unilateral=False)
+                        db.add(ex_obj); db.commit()
+                    se_new = SessionExercise(session_id=s.id, exercise_id=ex_obj.id, order_index=next_order)
+                    db.add(se_new); db.commit()
+                    ex_name_to_id[ex_name] = se_new.id
+                se_id = ex_name_to_id[ex_name]
+                # create/update set
+                if pd.isna(row["id"]):
+                    sp = SetPrescription(session_exercise_id=se_id, sets=int(row["sets"]), reps=int(row["reps"]),
+                                         intensity_pct_1rm=float(row["%1RM"]), load_kg=float(row["load_kg"]),
+                                         rest_sec=int(row["rest_sec"]), notes=str(row["notes"] or ""))
+                    db.add(sp)
+                else:
+                    sp = db.get(SetPrescription, int(row["id"]))
+                    if sp:
+                        sp.session_exercise_id = se_id
+                        sp.sets=int(row["sets"]); sp.reps=int(row["reps"])
+                        sp.intensity_pct_1rm=float(row["%1RM"]); sp.load_kg=float(row["load_kg"])
+                        sp.rest_sec=int(row["rest_sec"]); sp.notes=str(row["notes"] or "")
+            db.commit()
+            st.success("Session saved."); st.rerun()
+
+    # -------- Athlete view (read-only) --------
+    st.subheader("Session view for athlete")
+    # Build grouped table
+    grouped_rows = []
+    for se in (db.query(SessionExercise).filter(SessionExercise.session_id == s.id).order_by(SessionExercise.order_index).all()):
+        ex = db.get(Exercise, se.exercise_id)
+        sets_ = db.query(SetPrescription).filter(SetPrescription.session_exercise_id == se.id).all()
+        for sp in sets_:
+            grouped_rows.append({
+                "Exercise": ex.name,
+                "Sets": sp.sets,
+                "Reps": sp.reps,
+                "%1RM": int(sp.intensity_pct_1rm or 0),
+                "Load (kg)": float(sp.load_kg or 0.0),
+                "Rest (s)": int(sp.rest_sec or 0),
+                "Notes": sp.notes or "",
+                "Tonnage (kg)": compute_tonnage(sp.sets, sp.reps, sp.load_kg)
+            })
+    if grouped_rows:
+        df_view = pd.DataFrame(grouped_rows)
+        st.dataframe(df_view, use_container_width=True)
+        st.info(f"**Total session tonnage (saved): {df_view['Tonnage (kg)'].sum():.1f} kg**")
+    else:
+        st.caption("No sets saved yet.")
+
+    # Export CSV (saved data)
+    if grouped_rows:
+        total_row = {k: "" for k in grouped_rows[0].keys()}
+        total_row["Exercise"] = "TOTAL"
+        total_row["Tonnage (kg)"] = round(sum(r["Tonnage (kg)"] for r in grouped_rows), 1)
+        out_rows = grouped_rows + [total_row]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(out_rows[0].keys()))
+        writer.writeheader(); writer.writerows(out_rows)
         st.download_button("⬇️ Export session to CSV (with TOTAL)", buf.getvalue(), file_name=f"session_{s.id}.csv", mime="text/csv")
 
     db.close()
@@ -637,13 +623,12 @@ def page_settings():
     st.title("⚙️ Settings")
     st.write("SQLite path: `/tmp/strength_mvp.db` — Exercise images under `/tmp/exercise_images`")
     if st.button("Reset database (danger)"):
-        Base.metadata.drop_all(engine); Base.metadata.create_all(engine); init_demo_data(); st.success("Database reset.")
+        Base.metadata.drop_all(engine); Base.metadata.create_all(engine); init_demo_data(); st.success("Database reset."); st.rerun()
 
-# Layout & Sidebar
+# ---------- Layout & Sidebar ----------
 st.set_page_config(page_title="Strength Prescriptor (MVP)", layout="wide")
 with st.sidebar:
     st.title("Strength Prescriptor (MVP)")
-    # Sidebar quick-create with form
     with st.form("sidebar_quick_create", clear_on_submit=True):
         try:
             db_sb = SessionLocal()
@@ -672,11 +657,11 @@ with st.sidebar:
             st.success(f"Session #{ns.id} created for {date_sb}")
             st.session_state["focus_session_id"] = ns.id
             st.session_state["nav"] = "Sessions"
-            st.experimental_rerun()
+            st.rerun()
 
     page = st.radio("Navigation", ["Calendar", "Sessions", "Strength Tests", "Exercises", "Analytics", "Settings"], key="nav")
 
-# Router
+# ---------- Router ----------
 if page == "Calendar":
     page_calendar()
 elif page == "Sessions":
