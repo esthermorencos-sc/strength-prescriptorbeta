@@ -1,13 +1,15 @@
+
 # app.py
 # Strength Prescriptor (MVP) — Streamlit
-# - Visual calendar to create sessions + DRAG & DROP to reschedule (streamlit-calendar)
-# - Sessions: sets, reps, %1RM + 1RM (autofill if test) -> suggested kg (editable/manual)
-# - Edit/Delete sets, per-exercise and total session tonnage
-# - Export session CSV (includes TOTAL row)
-# - Analytics: per-session tonnage & weekly cumulative chart
-# - Exercises: extended seed list + image upload/display
+# FIX: use /tmp for SQLite & images (writable on Streamlit Cloud)
+# - Visual calendar (create + drag & drop reschedule)
+# - Sessions: %1RM + 1RM (autofill) -> suggested kg (editable/manual)
+# - Edit/Delete sets, per-exercise & total session tonnage
+# - Export CSV (TOTAL row)
+# - Analytics charts
+# - Exercises with image upload/display
 #
-# No authentication. SQLite DB created on first run.
+# No authentication.
 
 from __future__ import annotations
 import os
@@ -28,14 +30,24 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 # -----------------------------
+# Writable paths (Streamlit Cloud)
+# -----------------------------
+DB_PATH = "/tmp/strength_mvp.db"         # /tmp is writable in Streamlit Cloud
+IMAGES_DIR = "/tmp/exercise_images"
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# -----------------------------
 # DB (SQLite for MVP)
 # -----------------------------
-engine = create_engine("sqlite:///strength_mvp.db", echo=False, future=True)
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    echo=False,
+    future=True,
+    connect_args={"check_same_thread": False},  # allow usage across threads
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
-
-IMAGES_DIR = "exercise_images"
-os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # -----------------------------
 # MODELS
@@ -116,6 +128,7 @@ class StrengthTest(Base):
     client = relationship("Client")
     exercise = relationship("Exercise")
 
+# Ensure tables exist (first run)
 Base.metadata.create_all(engine)
 
 # -----------------------------
@@ -364,8 +377,6 @@ def page_calendar():
                 st.error(f"Couldn't parse date: {e}")
 
         # eventDrop (drag & drop) — normalize expected payloads
-        # Some versions return {'eventDrop': {'event': {'id': '...', 'start': '...'}}}
-        # Others may return {'event': {'id': '...', 'start': '...'}, 'action': 'eventDrop'}
         ev = None
         if "eventDrop" in cal:
             ev = cal.get("eventDrop", {}).get("event")
@@ -560,8 +571,7 @@ def page_sessions():
             rows.append(total_row)
 
             buf = io.StringIO()
-            import csv as _csv
-            writer = _csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
             writer.writeheader(); writer.writerows(rows)
             st.download_button(
                 label="⬇️ Export session to CSV (with TOTAL)",
@@ -621,7 +631,7 @@ def page_analytics():
 
 def page_settings():
     st.title("⚙️ Settings")
-    st.write("Local SQLite DB file: `strength_mvp.db`")
+    st.write("SQLite file path: `/tmp/strength_mvp.db` (ephemeral)")
     if st.button("Reset database (danger)"):
         Base.metadata.drop_all(engine)
         Base.metadata.create_all(engine)
